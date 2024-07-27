@@ -1,0 +1,79 @@
+---
+# Use to test python code in poetry projects.
+#
+name: _test_python_poetry
+
+on:
+  workflow_call:
+    inputs:
+      DEVCONTAINER:
+        description: "full name of the devcontainer image used to run the job/workflow"
+        type: string
+        required: true
+      AWS_ACCOUNT_ID:
+        type: string
+        required: true
+      AWS_DEFAULT_REGION:
+        description: "AWS region where to push the container"
+        type: string
+        default: "eu-central-1"
+      USE_LFS:
+        type: boolean
+        default: false
+      testCmd:
+        description: "the run command to execute as 'test' inside the devcontainer"
+        type: string
+        default: "poetry run pytest"
+      setupCmd:
+        description: "the command to execute to setup the environment"
+        type: string
+        default: "bash setup_localdev.sh"
+    secrets:
+      ORG_CORE_NEXUS_CI_USER:
+        required: true
+      ORG_CORE_NEXUS_CI_PWD:
+        required: true
+      DEVCONTAINER_ECR_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  _test_python_poetry:
+    runs-on: [self-hosted, cicd]
+    container:
+      image: ${{ inputs.DEVCONTAINER }}
+      credentials:
+        username: "AWS"
+        password: ${{ secrets.DEVCONTAINER_ECR_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: ${{ inputs.USE_LFS }}
+      - name: AWS assume role build, push to ECR, S3
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.AWS_ACCOUNT_ID }}:role/github-actions
+          aws-region: "${{ inputs.AWS_DEFAULT_REGION }}"
+          role-duration-seconds: 3600
+          role-session-name: assume_role_for_ecr_s3
+      - name: Load cached venv
+        id: cached-poetry-dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('**/poetry.lock') }}
+
+      - name: poetry dependency install
+        if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+        env:
+          POETRY_HTTP_BASIC_WEFOX_PASSWORD: ${{ secrets.ORG_CORE_NEXUS_CI_PWD }}
+          POETRY_HTTP_BASIC_WEFOX_USERNAME: ${{ secrets.ORG_CORE_NEXUS_CI_USER }}
+        run: ${{ inputs.setupCmd }}
+      - name: poetry run test
+        run: ${{ inputs.testCmd }}
+      - name: black check
+        run: poetry run python -m black --check .

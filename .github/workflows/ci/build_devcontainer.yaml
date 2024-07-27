@@ -1,0 +1,151 @@
+---
+# Use to (pre)build devcontainer
+#
+# then the devcontainer could be used as action or as container where to run job
+# Currently only devcontainer defined with a `.devcontainer/Dockerfile` is supported.
+# By default `runCmd` call a per repo script named `devops/publish-package.sh`.
+#
+name: _build_devcontainer
+
+on:
+  workflow_call:
+    inputs:
+      APP_NAME:
+        description: "name of the app, use as basename for the container image"
+        type: string
+        required: true
+      AWS_ACCOUNT_ID:
+        type: string
+        required: true
+      AWS_DEFAULT_REGION:
+        description: "AWS region where to push the container"
+        type: string
+        default: "eu-central-1"
+      AWS_TOKEN_TTL:
+        description: "AWS token time to live in seconds"
+        type: number
+        default: 1200
+      AWS_S3_CACHE_BUCKET:
+        description: "AWS bucket to cache build artifacts"
+        type: string
+        default: "wefox-ai-wai-oci-cache-dev"
+    outputs:
+      image_full_name:
+        description: fullname of the devcontainer's image (built & pushed)
+        value: ${{ jobs.build_devcontainer.outputs.image_full_name }}
+      image_registry:
+        description: registry of the devcontainer's image (built & pushed)
+        value: ${{ jobs.build_devcontainer.outputs.image_registry }}
+      image_digest:
+        description: digest of the devcontainer's image (built & pushed), could be empty
+        value: ${{ jobs.build_devcontainer.outputs.image_digest }}
+      image_tag:
+        description: tag of the devcontainer's image (built & pushed)
+        value: ${{ jobs.build_devcontainer.outputs.image_tag }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build_devcontainer:
+    runs-on: [self-hosted, cicd]
+    outputs:
+      # image_full_name: $\{{ steps.publish-docker.outputs.image_registry }}:$\{{ steps.publish-docker.outputs.image_tag }}
+      image_full_name: ${{ steps.build-image-reference.outputs.image_full_name }}
+      image_registry: ${{ steps.build-image-reference.outputs.image_registry }}
+      image_digest: ${{ steps.build-image-reference.outputs.image_digest }}
+      image_tag: ${{ steps.build-image-reference.outputs.image_tag }}
+    env:
+      # can not use secrets as part of output, so no secrets like `secrets.AWS_ACCOUNT_ID` into registry
+      IMAGE_BASENAME: ${{ inputs.APP_NAME }}-devcontainer
+      REGISTRY: ${{ inputs.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.AWS_DEFAULT_REGION }}.amazonaws.com/${{ inputs.APP_NAME }}-devcontainer
+    steps:
+      - uses: actions/checkout@v4
+      - name: AWS assume role build, push to ECR, S3
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.AWS_ACCOUNT_ID }}:role/github-actions
+          aws-region: "${{ inputs.AWS_DEFAULT_REGION }}"
+          role-duration-seconds: ${{ inputs.AWS_TOKEN_TTL }}
+          role-session-name: assume_role_for_ecr_s3
+      - name: Create registry in ECR if not exists
+        run: |
+          IMAGES=$(aws ecr describe-images --repository-name "$IMAGE_BASENAME" --region "${{ inputs.AWS_DEFAULT_REGION }}" --query "sort_by(imageDetails,& imagePushedAt)[ * ].imageTags[ * ]" || echo "")
+          if [ -z "${IMAGES}" ]; then
+            echo "create ecr repository '$IMAGE_BASENAME'"
+            aws ecr create-repository --repository-name "$IMAGE_BASENAME" --region "${{ inputs.AWS_DEFAULT_REGION }}"
+          fi
+      - name: Define parameters and search if the image is already published
+        id: params
+        run: |
+          echo "CACHE_S3_PREFIX=$(date +'%Y-%m')/" >> $GITHUB_OUTPUT #TODO use ${{ inputs.APP_NAME }}-devcontainer ?
+          echo "image_registry=$REGISTRY" >> $GITHUB_OUTPUT
+
+          IMAGE_TAG="${{ hashFiles('.devcontainer/**') }}"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+          MAYBE_DIGEST=$(aws ecr describe-images --repository-name "$IMAGE_BASENAME" --region "${{ inputs.AWS_DEFAULT_REGION }}" --query "imageDetails[*].imageDigest" --image-id imageTag="$IMAGE_TAG" --output text || echo "")
+          if [ -n "${MAYBE_DIGEST}" ]; then
+            echo "image_digest=$MAYBE_DIGEST" >> $GITHUB_OUTPUT
+            echo "::notice title={build_devcontainer}::image is already published for the content of '.devcontainer/**'"
+          fi
+      # - name: Set up QEMU
+      #   uses: docker/setup-qemu-action@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        if: steps.params.outputs.image_digest == null
+      # - name: Login to Amazon ECR
+      #   uses: docker/login-action@v2
+      #   with:
+      #     registry: ${{ env.REGISTRY }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        if: steps.params.outputs.image_digest == null
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v5
+        if: steps.params.outputs.image_digest == null
+        with:
+          context: .devcontainer
+          push: true
+          # same tags should be used by other jobs
+          # ${{hashFiles('.devcontainer/**')}}
+          tags: ${{ env.REGISTRY }}:${{ steps.params.outputs.image_tag }}
+          # registry as cache not supported by ECR, see [[ECR] [request]: support cache manifest · Issue #876 · aws/containers-roadmap](https://github.com/aws/containers-roadmap/issues/876)
+          # cache-from: type=registry,ref=${{ env.REGISTRY }}:buildcache
+          # cache-to: type=registry,ref=${{ env.REGISTRY }}:buildcache,mode=max
+          #
+          # try with S3 remote cache (setup cleanup policy), see https://github.com/moby/buildkit#s3-cache-experimental
+          # metrics from rust (wefox-ai-mfy-example-api)
+          # - empty cache
+          #   - exporting to image: 58.7s (917MB)
+          #   - exporting cache to s3: 13.6s (877MB)
+          #   - duration build_push: 2m36s
+          #   - duration total github job: 2m52s
+          # - cache filles (no change)
+          #   - duration build_push: 4s
+          #   - duration total github job: 19s
+          cache-from: "type=s3,region=${{ inputs.AWS_DEFAULT_REGION }},bucket=${{ inputs.AWS_S3_CACHE_BUCKET }},prefix=${{ steps.params.outputs.CACHE_S3_PREFIX }}"
+          cache-to: "type=s3,region=${{ inputs.AWS_DEFAULT_REGION }},bucket=${{ inputs.AWS_S3_CACHE_BUCKET }},mode=max,prefix=${{ steps.params.outputs.CACHE_S3_PREFIX }}"
+          sbom: true # TODO check if 'false' is an optimization for s3 storage
+          provenance: false # TODO check if it's an optimization for s3 storage
+          #
+          # TODO try with gh cache (see limitation)
+          # TODO try local + FSX / EFS disk mounted on run (see feedback from linked issue above)
+      - id: build-image-reference
+        run: |
+          echo "image_registry=${{ env.REGISTRY }}" >> $GITHUB_OUTPUT
+          echo "image_tag=${{ steps.params.outputs.image_tag }}" >> $GITHUB_OUTPUT
+          MAYBE_DIGEST="${{ steps.params.outputs.image_digest }}"
+          if [ -z "$MAYBE_DIGEST" ] ; then
+            MAYBE_DIGEST="${{ steps.build-push.outputs.digest }}"
+          fi
+          echo "image_digest=$MAYBE_DIGEST" >> $GITHUB_OUTPUT
+          if [ -z "$MAYBE_DIGEST" ] ; then
+            echo "::warning title={build_devcontainer}::digest of container is empty, fallback to tag"
+            echo "image_full_name=${{ env.REGISTRY }}:${{ steps.params.outputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "image_full_name=${{ env.REGISTRY }}@$MAYBE_DIGEST" >> $GITHUB_OUTPUT
+          fi

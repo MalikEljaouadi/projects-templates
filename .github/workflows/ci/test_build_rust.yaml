@@ -1,0 +1,73 @@
+---
+# Use to build and to test
+#
+name: _test_build_rust
+
+on:
+  workflow_call:
+    inputs:
+      DEVCONTAINER:
+        description: "full name of the devcontainer image used to run the job/workflow"
+        type: string
+        required: true
+      APP_NAME:
+        description: "name of the app, use as basename for the container image"
+        type: string
+        required: true
+      AWS_ACCOUNT_ID:
+        type: string
+        required: true
+      AWS_DEFAULT_REGION:
+        description: "AWS region where to push the container"
+        type: string
+        default: "eu-central-1"
+      AWS_S3_CACHE_BUCKET:
+        description: "AWS bucket to cache build artifacts"
+        type: string
+        default: "wefox-ai-wai-sccache-dev"
+    secrets:
+      ORG_ECR_TOKEN_AI:
+        required: true
+      ORG_CARGO_REGISTRIES_WEFOX_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  _test_build_rust:
+    runs-on: [self-hosted, cicd]
+    container:
+      image: ${{ inputs.DEVCONTAINER }}
+      credentials:
+        username: "AWS"
+        password: ${{ secrets.ORG_ECR_TOKEN_AI }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+      CARGO_REGISTRIES_WEFOX_TOKEN: "${{ secrets.ORG_CARGO_REGISTRIES_WEFOX_TOKEN }}"
+      RUSTC_WRAPPER: "sccache"
+      RUST_BACKTRACE: "1"
+      SCCACHE_BUCKET: ${{ inputs.AWS_S3_CACHE_BUCKET }}
+      SCCACHE_REGION: ${{ inputs.AWS_DEFAULT_REGION }}
+      SCCACHE_S3_USE_SSL: true
+      SCCACHE_S3_KEY_PREFIX: ${{ inputs.APP_NAME }}
+      CARGO_INCREMENTAL: false # to please SCCACHE (always true ?)
+    steps:
+      - uses: actions/checkout@v4
+      - name: AWS assume role build, push to ECR, S3
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.AWS_ACCOUNT_ID }}:role/github-actions
+          aws-region: "${{ inputs.AWS_DEFAULT_REGION }}"
+          role-duration-seconds: 3600
+          role-session-name: assume_role_for_ecr_s3
+      - run: ${{ env.RUSTC_WRAPPER }} --start-server
+        if: ${{ contains('sccache', env.RUSTC_WRAPPER) }}
+      - run: cargo fetch
+      - run: cargo test --offline -- --nocapture
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy  --offline --workspace --all-features --all-targets -- --deny warnings --allow deprecated
+      - run: ${{ env.RUSTC_WRAPPER }} --stop-server
+        if: ${{ contains('sccache', env.RUSTC_WRAPPER) }}
