@@ -1,0 +1,134 @@
+---
+# Use to deploy chart via helmfile
+
+name: _deploy_charts
+
+on:
+  workflow_call:
+    inputs:
+      APP_NAME:
+        description: "name of the app, use as release name by helm"
+        type: string
+        required: true
+      APP_NAMESPACE:
+        description: "namespace for the app (in Kubernetes cluster)"
+        type: string
+        required: true
+      AWS_ACCOUNT_ID:
+        type: string
+        required: true
+      AWS_DEFAULT_REGION:
+        description: "AWS region where to push the container"
+        type: string
+        default: "eu-central-1"
+      AWS_TOKEN_TTL:
+        description: "AWS token time to live in seconds"
+        type: number
+        default: 1200
+      CLUSTER_NAME:
+        description: "AWS EKS cluster to deploy to"
+        type: string
+        default: null
+      HELMFILE_DIR:
+        description: "the relative path of folder with `helmfile.yaml`"
+        type: string
+        default: devops
+      TESTKUBE_TEST_NAME:
+        description: "name of the test to run after deploy"
+        type: string
+        required: false
+      TESTKUBE_TEST_VARIABLES:
+        description: "override env variables of the test to run after deploy"
+        type: string
+        required: false
+      TESTKUBE_TESTSUITE_NAME:
+        description: "name of the testsuite to run after deploy"
+        type: string
+        required: false
+      TESTKUBE_TESTSUITE_VARIABLES:
+        description: "override env variables of the testsuite to run after deploy"
+        type: string
+        required: false
+      TESTKUBE_RUN_ON_PRO:
+        description: "should the test/testsuite be executed on pro or not"
+        type: boolean
+        default: false
+    secrets:
+      ORG_CORE_NEXUS_CI_USER:
+        required: true
+      ORG_CORE_NEXUS_CI_PWD:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # TODO find a way to enforce cluster/* on master branch only
+  # [Run workflow on push tag on specific branch - Code to Cloud / GitHub Actions - GitHub Support Community](https://github.community/t/run-workflow-on-push-tag-on-specific-branch/17519)
+  _deploy:
+    # see https://docs.github.com/en/actions/reference/context-and-expression-syntax-for-github-actions
+    # if: ${{ github.event.base_ref == 'refs/heads/master' || github.ref == 'refs/tags/cluster/ai-dev' }}
+    runs-on: [self-hosted, cicd]
+    steps:
+      - name: Select env
+        id: select_env
+        # see https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#outputsoutput_id
+        env:
+          GITHUB_CONTEXT: ${{ toJson(github) }}
+          CLUSTER_NAME: ${{ inputs.CLUSTER_NAME }}
+        run: |
+          # echo "GITHUB_REF=${GITHUB_REF}"
+          echo "GITHUB_CONTEXT=${GITHUB_CONTEXT}"
+          if [[ "$GITHUB_REF" == refs/tags/cluster/* ]]; then
+            export CLUSTER_NAME=${GITHUB_REF#refs/tags/cluster/}
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          elif [[ "$GITHUB_REF" == refs/heads/cluster/* ]]; then
+            export CLUSTER_NAME=${GITHUB_REF#refs/heads/cluster/}
+            echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
+          fi
+          echo "cluster=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+          echo "::warning ::cluster_name: ${CLUSTER_NAME}"
+      - name: Checkout APP repository
+        uses: actions/checkout@v4
+      - name: AWS assume role build, push to ECR and EKS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.AWS_ACCOUNT_ID }}:role/github-actions
+          aws-region: "${{ inputs.AWS_DEFAULT_REGION }}"
+          role-duration-seconds: ${{ inputs.AWS_TOKEN_TTL }}
+          role-session-name: assume_role_for_ecr_eks
+      - name: Deploy to EKS
+        uses: uberforcede/wefox-devops-gh-action-deploy-tools@master
+        id: deploy
+        with:
+          runCmd: |
+            aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME}" --alias "deploy@${EKS_CLUSTER_NAME}"
+            helmfile apply --file "${{ inputs.HELMFILE_DIR }}/helmfile.yaml"
+        env:
+          APP_NAMESPACE: "${{ inputs.APP_NAMESPACE }}"
+          APP_NAME: "${{ inputs.APP_NAME }}"
+          EKS_CLUSTER_NAME: "${{ steps.select_env.outputs.cluster }}"
+          WEFOX_REGISTRY_USERNAME: "${{ secrets.ORG_CORE_NEXUS_CI_USER }}"
+          WEFOX_REGISTRY_PASSWORD: "${{ secrets.ORG_CORE_NEXUS_CI_PWD }}"
+      - name: trigger Testkube test
+        uses: kubeshop/testkube-run-action@v1
+        # workaround to prevent test/testsuite execution in production cluster
+        if: "${{ inputs.TESTKUBE_TEST_NAME != null && (steps.select_env.outputs.cluster != 'ai-pro' || inputs.TESTKUBE_RUN_ON_PRO == 'true') }}"
+        with:
+          url: "https://testkube.${{ steps.select_env.outputs.cluster }}.int.wefox.cloud/api/v1"
+          # dashboardUrl: "https://testkube.${{ steps.select_env.outputs.cluster }}.int.wefox.cloud/" # not yet available in 1.0.0
+          test: "${{ inputs.TESTKUBE_TEST_NAME }}"
+          # ref: ${{ github.event.pull_request.head.ref || github.head_ref || github.ref }} # diseable because the test could reference an other git repo
+          executionName: "${{ inputs.APP_NAME }} post deploy"
+          variables: ${{ inputs.TESTKUBE_TEST_VARIABLES }}
+      - name: trigger Testkube testsuite
+        uses: kubeshop/testkube-run-action@v1
+        if: "${{ inputs.TESTKUBE_TESTSUITE_NAME != null && (steps.select_env.outputs.cluster != 'ai-pro' || inputs.TESTKUBE_RUN_ON_PRO == 'true') }}"
+        with:
+          url: "https://testkube.${{ steps.select_env.outputs.cluster }}.int.wefox.cloud/api/v1"
+          # dashboardUrl: "https://testkube.${{ steps.select_env.outputs.cluster }}.int.wefox.cloud/" # not yet available in 1.0.0
+          testSuite: "${{ inputs.TESTKUBE_TESTSUITE_NAME }}"
+          # ref: ${{ github.event.pull_request.head.ref || github.head_ref || github.ref }} # diseable because the test could reference an other git repo
+          executionName: "${{ inputs.APP_NAME }} post deploy"
+          variables: ${{ inputs.TESTKUBE_TESTSUITE_VARIABLES }}
